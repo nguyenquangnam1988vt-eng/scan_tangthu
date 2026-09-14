@@ -1,0 +1,26 @@
+name: ho_so_scanner
+description: Quét hồ sơ và gửi qua Zalo
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+  cunning_document_scanner: ^1.3.0
+  path_provider: ^2.1.2
+  pdf: ^3.10.8
+  printing: ^5.12.0          # để xem trước PDF
+  image: ^4.1.7
+  archive: ^3.4.10
+  share_plus: ^7.2.2
+  file_picker: ^8.0.0
+
+dev_dependencies:
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
