@@ -23,6 +23,9 @@ class _HomeScreenState extends State<HomeScreen> {
   late TextEditingController _caseCtrl;
   Timer? _caseDebounce;
 
+  // 🔐 Mật khẩu cho phiên làm việc — chỉ ở RAM, tắt app là mất
+  String? _sessionPassword;
+
   @override
   void initState() {
     super.initState();
@@ -67,6 +70,22 @@ class _HomeScreenState extends State<HomeScreen> {
       await _save();
       if (mounted) setState(() {});
     });
+  }
+
+  // ---------- MẬT KHẨU PHIÊN ----------
+  Future<void> _openPasswordDialog() async {
+    final result = await askPassword(context, current: _sessionPassword);
+    if (result == null) return; // Huỷ
+    setState(() {
+      _sessionPassword = result.isEmpty ? null : result;
+    });
+    if (!mounted) return;
+    toast(
+      context,
+      _sessionPassword == null
+          ? 'Đã bỏ mật khẩu'
+          : 'Đã đặt mật khẩu cho phiên làm việc',
+    );
   }
 
   // ---------- CLEAR ----------
@@ -285,7 +304,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ---------- SHARE — ĐÃ SỬA, BỎ ShareResultStatus ----------
+  // ---------- SHARE ----------
   Future<void> _share() async {
     if (_session.totalFiles == 0) return;
     if (_session.caseName.isEmpty) {
@@ -295,10 +314,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
     setState(() => _busy = true);
     try {
-      await ExportService.shareCase(_session.caseName);
+      await ExportService.shareCase(
+        _session.caseName,
+        password: _sessionPassword,
+      );
       if (!mounted) return;
 
-      // Không check status — share xong là hỏi clear luôn
+      // Không check ShareResultStatus — tránh lỗi version share_plus
       final clear = await confirm(
         context,
         title: 'Đã gửi xong!',
@@ -331,6 +353,17 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('Quét & Gửi hồ sơ'),
         actions: [
+          IconButton(
+            icon: Icon(
+              _sessionPassword == null ? Icons.lock_open : Icons.lock,
+              color:
+                  _sessionPassword == null ? null : Colors.amber.shade700,
+            ),
+            tooltip: _sessionPassword == null
+                ? 'Đặt mật khẩu cho file ZIP'
+                : 'Đã bật mật khẩu — nhấn để đổi/bỏ',
+            onPressed: _openPasswordDialog,
+          ),
           if (_session.totalFiles > 0 || _session.persons.isNotEmpty)
             IconButton(
               icon: const Icon(Icons.delete_sweep_outlined),
@@ -388,7 +421,8 @@ class _HomeScreenState extends State<HomeScreen> {
                           icon: const Icon(Icons.person_add_alt_1),
                           label: const Text('Thêm người vào hồ sơ'),
                           style: OutlinedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            padding:
+                                const EdgeInsets.symmetric(vertical: 12),
                           ),
                         ),
                       ),
@@ -460,6 +494,28 @@ class _HomeScreenState extends State<HomeScreen> {
                       fontSize: 12, color: Colors.grey.shade700),
                 ),
               ),
+              if (_sessionPassword != null)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.amber.shade100,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.lock,
+                          size: 12, color: Colors.amber.shade900),
+                      const SizedBox(width: 3),
+                      Text('Có mật khẩu',
+                          style: TextStyle(
+                              fontSize: 11,
+                              color: Colors.amber.shade900,
+                              fontWeight: FontWeight.w600)),
+                    ],
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 8),
