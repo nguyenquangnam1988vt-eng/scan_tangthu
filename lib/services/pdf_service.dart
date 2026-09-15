@@ -26,8 +26,6 @@ import '../models/session.dart';
 ///      - controlled unsharp mask
 ///   6) JPEG encode
 ///   7) A4 PDF
-///
-/// The public API is intentionally kept compatible with the original service.
 class PdfService {
   static Future<File> createPdf({
     required List<String> imagePaths,
@@ -44,7 +42,6 @@ class PdfService {
     }
 
     final quality = jpegQuality.clamp(88, 97);
-    // 2200 px is roughly 260-300 DPI on A4 and is a good phone/RAM balance.
     final width = maxWidth.clamp(1600, 2600);
 
     final jpgBytesList = await compute(
@@ -97,7 +94,6 @@ class PdfService {
         if (bytes.isEmpty) continue;
 
         // OpenCV does not apply JPEG EXIF orientation for imdecode().
-        // We therefore normalize orientation once with package:image.
         final orientedBytes = _normalizeExifOrientation(bytes);
 
         Uint8List? processed;
@@ -114,7 +110,7 @@ class PdfService {
           processed = null;
         }
 
-        // Safe fallback: existing pure-Dart pipeline.
+        // Safe fallback: pure-Dart pipeline.
         processed ??= _processWithDartFallback(
           orientedBytes,
           mode,
@@ -145,6 +141,8 @@ class PdfService {
     int jpegQuality,
   ) {
     cv.Mat? src;
+    cv.Mat? work;
+    cv.Mat? corrected;
 
     try {
       src = cv.imdecode(bytes, cv.IMREAD_COLOR);
@@ -152,62 +150,50 @@ class PdfService {
         throw StateError('OpenCV không decode được ảnh.');
       }
 
-      var work = src;
+      work = src;
 
       // Do the expensive contour search on a much smaller image.
       // The full-resolution image is retained for final warp.
       if (work.cols > maxWidth) {
         final scale = maxWidth / work.cols;
-        final resized = cv.resize(
+        work = cv.resize(
           work,
           (maxWidth, (work.rows * scale).round()),
           interpolation: cv.INTER_AREA,
         );
-        work = resized;
       }
 
-      // If requested width is modest, still cap contour-search image at
-      // around 1200 px. This keeps older iPhones responsive.
+      // Cap contour-search image at ~960 px for older iPhones.
       final detection = _detectDocumentAndWarp(
         work,
         maxDetectionWidth: 960,
       );
 
-      // _detectDocumentAndWarp() returns a Mat in the same scale as work.
-      var corrected = detection ?? work;
+      corrected = detection ?? work;
 
-      // If detection returned a new Mat, work is no longer needed.
-      if (!identical(corrected, work)) {
-        _safeDispose(work);
-      }
-
-      // Additional enhancement after perspective correction.
+      // Enhance after perspective correction.
       final beforeEnhance = corrected;
-      corrected = _enhanceOpenCv(
-        corrected,
-        mode,
-      );
+      corrected = _enhanceOpenCv(corrected, mode);
       if (!identical(corrected, beforeEnhance)) {
         _safeDispose(beforeEnhance);
       }
 
-      final encoded = _encodeJpeg(
-        corrected,
-        jpegQuality,
-      );
-
-      _safeDispose(corrected);
-      return encoded;
+      return _encodeJpeg(corrected, jpegQuality);
     } finally {
+      // Dispose corrected first, but avoid double-dispose.
+      if (corrected != null && !identical(corrected, src)) {
+        _safeDispose(corrected);
+      }
+      if (work != null &&
+          !identical(work, src) &&
+          !identical(work, corrected)) {
+        _safeDispose(work);
+      }
       _safeDispose(src);
     }
   }
 
   /// Detect the largest convincing 4-corner document contour.
-  ///
-  /// Important optimization:
-  /// contour detection is done on a reduced image, while the working image is
-  /// already limited to maxWidth. That avoids a full 4K/12MP Canny pass.
   static cv.Mat? _detectDocumentAndWarp(
     cv.Mat src, {
     int maxDetectionWidth = 1200,
@@ -217,8 +203,15 @@ class PdfService {
     cv.Mat? blurred;
     cv.Mat? edges;
     cv.Mat? closed;
-    cv.Mat? warped;
     cv.Mat? kernel;
+    cv.Mat? warped;
+
+    cv.Contours? contours;
+    cv.VecVec4i? hierarchy;
+
+    cv.VecPoint? source;
+    cv.VecPoint? destination;
+    cv.Mat? transform;
 
     try {
       small = src;
@@ -236,26 +229,14 @@ class PdfService {
       }
 
       gray = cv.cvtColor(small, cv.COLOR_BGR2GRAY);
-      blurred = cv.gaussianBlur(
-        gray,
-        (5, 5),
-        0,
-      );
+      blurred = cv.gaussianBlur(gray, (5, 5), 0);
 
-      // Canny thresholds are intentionally moderate: document borders can be
-      // weak when the paper is white on a pale table.
-      edges = cv.canny(
-        blurred,
-        45,
-        140,
-        l2gradient: true,
-      );
+      // Canny thresholds are moderate: document borders can be weak
+      // when the paper is white on a pale table.
+      edges = cv.canny(blurred, 45, 140, l2gradient: true);
 
       // Close small breaks in paper edges.
-      kernel = cv.getStructuringElement(
-        cv.MORPH_RECT,
-        (5, 5),
-      );
+      kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 5));
       closed = cv.morphologyEx(
         edges,
         cv.MORPH_CLOSE,
@@ -263,17 +244,15 @@ class PdfService {
         iterations: 2,
       );
 
-      final (contours, hierarchy) = cv.findContours(
+      final result = cv.findContours(
         closed,
         cv.RETR_EXTERNAL,
         cv.CHAIN_APPROX_SIMPLE,
       );
+      contours = result.$1;
+      hierarchy = result.$2;
 
-      if (contours.isEmpty) {
-        _safeDispose(contours);
-        _safeDispose(hierarchy);
-        return null;
-      }
+      if (contours.isEmpty) return null;
 
       final imageArea = small.cols * small.rows.toDouble();
       final candidates = <_QuadCandidate>[];
@@ -285,8 +264,7 @@ class PdfService {
         final perimeter = cv.arcLength(contour, true);
         if (perimeter <= 0) continue;
 
-        // Try several approximation strengths. Some camera edges need a
-        // slightly looser epsilon than others.
+        // Try several approximation strengths.
         cv.VecPoint? bestApprox;
         for (final epsRatio in <double>[0.012, 0.018, 0.025, 0.035]) {
           final approx = cv.approxPolyDP(
@@ -303,49 +281,39 @@ class PdfService {
 
         if (bestApprox == null) continue;
 
-        final points = bestApprox.toList();
-        if (points.length != 4) {
+        try {
+          final points = bestApprox.toList();
+          if (points.length != 4) continue;
+
+          final ordered = _orderQuad(points);
+          final rectangleScore = _rectangleScore(ordered);
+          final areaRatio = area / imageArea;
+
+          if (rectangleScore < 0.50) continue;
+          if (areaRatio < 0.12) continue;
+
+          final borderBonus = _borderCoverageBonus(
+            ordered,
+            small.cols,
+            small.rows,
+          );
+          final score = areaRatio * 0.62 +
+              rectangleScore * 0.28 +
+              borderBonus * 0.10;
+
+          candidates.add(
+            _QuadCandidate(
+              points: ordered,
+              score: score,
+              areaRatio: areaRatio,
+            ),
+          );
+        } finally {
           _safeDispose(bestApprox);
-          continue;
         }
-
-        final ordered = _orderQuad(points);
-        final rectangleScore = _rectangleScore(ordered);
-        final areaRatio = area / imageArea;
-
-        // Reject tiny/random rectangular contours.
-        if (rectangleScore < 0.50) {
-          _safeDispose(bestApprox);
-          continue;
-        }
-        if (areaRatio < 0.12) {
-          _safeDispose(bestApprox);
-          continue;
-        }
-
-        final borderBonus = _borderCoverageBonus(ordered, small.cols, small.rows);
-        final score =
-            areaRatio * 0.62 +
-            rectangleScore * 0.28 +
-            borderBonus * 0.10;
-
-        candidates.add(
-          _QuadCandidate(
-            points: ordered,
-            score: score,
-            areaRatio: areaRatio,
-          ),
-        );
-
-        _safeDispose(bestApprox);
       }
 
-      _safeDispose(contours);
-      _safeDispose(hierarchy);
-
-      if (candidates.isEmpty) {
-        return null;
-      }
+      if (candidates.isEmpty) return null;
 
       candidates.sort((a, b) => b.score.compareTo(a.score));
       final selected = candidates.first;
@@ -360,8 +328,6 @@ class PdfService {
           )
           .toList();
 
-      // Output dimensions are derived from the measured edges instead of
-      // forcing an A4 aspect ratio. This avoids artificial stretching.
       final widthTop = _distance(srcPoints[0], srcPoints[1]);
       final widthBottom = _distance(srcPoints[3], srcPoints[2]);
       final heightLeft = _distance(srcPoints[0], srcPoints[3]);
@@ -370,9 +336,7 @@ class PdfService {
       var outWidth = math.max(widthTop, widthBottom).round();
       var outHeight = math.max(heightLeft, heightRight).round();
 
-      if (outWidth < 300 || outHeight < 300) {
-        return null;
-      }
+      if (outWidth < 300 || outHeight < 300) return null;
 
       // Avoid creating massive mats due to noisy contour geometry.
       const maxOutputSide = 2600;
@@ -383,19 +347,15 @@ class PdfService {
         outHeight = (outHeight * scale).round();
       }
 
-      // Ensure normal portrait/landscape ordering.
-      final destination = cv.VecPoint.fromList([
+      destination = cv.VecPoint.fromList([
         cv.Point(0, 0),
         cv.Point(outWidth - 1, 0),
         cv.Point(outWidth - 1, outHeight - 1),
         cv.Point(0, outHeight - 1),
       ]);
 
-      final source = cv.VecPoint.fromList(srcPoints);
-      final transform = cv.getPerspectiveTransform(
-        source,
-        destination,
-      );
+      source = cv.VecPoint.fromList(srcPoints);
+      transform = cv.getPerspectiveTransform(source, destination);
 
       warped = cv.warpPerspective(
         src,
@@ -405,19 +365,20 @@ class PdfService {
         borderMode: cv.BORDER_REPLICATE,
       );
 
+      return warped;
+    } finally {
       _safeDispose(transform);
       _safeDispose(source);
       _safeDispose(destination);
-
-      return warped;
-    } finally {
+      _safeDispose(contours);
+      _safeDispose(hierarchy);
       if (!identical(small, src)) _safeDispose(small);
       _safeDispose(gray);
       _safeDispose(blurred);
       _safeDispose(edges);
       _safeDispose(closed);
       _safeDispose(kernel);
-      // Do not dispose warped here: it is returned to caller.
+      // Do not dispose warped — returned to caller.
     }
   }
 
@@ -425,10 +386,7 @@ class PdfService {
   // OPENCV ENHANCEMENT
   // ==========================================================================
 
-  static cv.Mat _enhanceOpenCv(
-    cv.Mat src,
-    ScanMode mode,
-  ) {
+  static cv.Mat _enhanceOpenCv(cv.Mat src, ScanMode mode) {
     switch (mode) {
       case ScanMode.color:
         return _enhanceColor(src);
@@ -446,34 +404,15 @@ class PdfService {
     cv.Mat? sharpen;
 
     try {
-      // Bilateral filtering keeps document edges while reducing camera noise.
-      denoised = cv.bilateralFilter(
-        src,
-        5,
-        35,
-        35,
-      );
+      // Bilateral keeps document edges while reducing camera noise.
+      denoised = cv.bilateralFilter(src, 5, 35, 35);
 
       // Gentle contrast/brightness correction.
-      adjusted = cv.convertScaleAbs(
-        denoised,
-        alpha: 1.06,
-        beta: 2,
-      );
+      adjusted = cv.convertScaleAbs(denoised, alpha: 1.06, beta: 2);
 
       // Controlled unsharp mask.
-      blur = cv.gaussianBlur(
-        adjusted,
-        (0, 0),
-        1.1,
-      );
-      sharpen = cv.addWeighted(
-        adjusted,
-        1.25,
-        blur,
-        -0.25,
-        0,
-      );
+      blur = cv.gaussianBlur(adjusted, (0, 0), 1.1);
+      sharpen = cv.addWeighted(adjusted, 1.25, blur, -0.25, 0);
 
       return sharpen;
     } finally {
@@ -496,52 +435,22 @@ class PdfService {
 
     try {
       gray = cv.cvtColor(src, cv.COLOR_BGR2GRAY);
+      denoised = cv.bilateralFilter(gray, 5, 30, 30);
 
-      denoised = cv.bilateralFilter(
-        gray,
-        5,
-        30,
-        30,
-      );
-
-      // CLAHE gives local contrast without the aggressive global histogram
-      // stretching of the original implementation.
-      clahe = cv.createCLAHE(
-        clipLimit: 1.8,
-        tileGridSize: (8, 8),
-      );
+      // CLAHE for local contrast.
+      clahe = cv.createCLAHE(clipLimit: 1.8, tileGridSize: (8, 8));
       claheOut = clahe.apply(denoised);
 
-      // Illumination correction: divide image by a blurred background.
-      // This reduces shadows and uneven room lighting on the paper.
-      localBackground = cv.gaussianBlur(
-        claheOut,
-        (0, 0),
-        19,
-      );
+      // Illumination correction via local background division.
+      localBackground = cv.gaussianBlur(claheOut, (0, 0), 19);
+      normalized = _illuminationNormalize(claheOut, localBackground);
 
-      normalized = _illuminationNormalize(
-        claheOut,
-        localBackground,
-      );
-
-      blur = cv.gaussianBlur(
-        normalized,
-        (0, 0),
-        1.0,
-      );
-
-      sharpen = cv.addWeighted(
-        normalized,
-        1.24,
-        blur,
-        -0.24,
-        0,
-      );
+      blur = cv.gaussianBlur(normalized, (0, 0), 1.0);
+      sharpen = cv.addWeighted(normalized, 1.24, blur, -0.24, 0);
 
       return sharpen;
     } finally {
-      clahe?.dispose();
+      _safeDispose(clahe);
       _safeDispose(gray);
       _safeDispose(denoised);
       _safeDispose(claheOut);
@@ -565,35 +474,16 @@ class PdfService {
 
     try {
       gray = cv.cvtColor(src, cv.COLOR_BGR2GRAY);
+      denoised = cv.bilateralFilter(gray, 5, 25, 25);
 
-      // Bilateral preserves letter edges better than a large Gaussian blur.
-      denoised = cv.bilateralFilter(
-        gray,
-        5,
-        25,
-        25,
-      );
-
-      clahe = cv.createCLAHE(
-        clipLimit: 1.8,
-        tileGridSize: (8, 8),
-      );
+      clahe = cv.createCLAHE(clipLimit: 1.8, tileGridSize: (8, 8));
       claheOut = clahe.apply(denoised);
 
       // Remove slow-varying illumination before thresholding.
-      background = cv.gaussianBlur(
-        claheOut,
-        (0, 0),
-        15,
-      );
-      normalized = _illuminationNormalize(
-        claheOut,
-        background,
-      );
+      background = cv.gaussianBlur(claheOut, (0, 0), 15);
+      normalized = _illuminationNormalize(claheOut, background);
 
-      // Adaptive threshold is the key difference from a global threshold.
-      // Odd block size is required by OpenCV.
-      var blockSize = _adaptiveBlockSize(
+      final blockSize = _adaptiveBlockSize(
         normalized.cols,
         normalized.rows,
       );
@@ -607,11 +497,10 @@ class PdfService {
         10,
       );
 
-      // Close tiny gaps in characters, then remove isolated speckles.
-      kernelClose = cv.getStructuringElement(
-        cv.MORPH_RECT,
-        (3, 3),
-      );
+      // Close tiny gaps in characters. Do not apply MORPH_OPEN by default:
+      // on phone photos it can erase thin strokes, punctuation and
+      // Vietnamese diacritics.
+      kernelClose = cv.getStructuringElement(cv.MORPH_RECT, (3, 3));
       clean = cv.morphologyEx(
         binary,
         cv.MORPH_CLOSE,
@@ -619,13 +508,9 @@ class PdfService {
         iterations: 1,
       );
 
-      // Do not apply MORPH_OPEN by default: on phone photos it can erase
-      // thin strokes, punctuation and Vietnamese diacritics. The 3x3 close
-      // above is enough to reconnect tiny breaks while preserving character
-      // detail.
       return clean;
     } finally {
-      clahe?.dispose();
+      _safeDispose(clahe);
       _safeDispose(gray);
       _safeDispose(denoised);
       _safeDispose(claheOut);
@@ -638,27 +523,26 @@ class PdfService {
   }
 
   /// Normalize a document illuminated by a non-uniform light field.
-  ///
   /// Estimates slow-changing illumination from a heavily blurred background
-  /// and divides the document image by that field. This is more robust than
-  /// global brightness/contrast when the phone is lit from one side.
+  /// and divides the document image by that field.
   static cv.Mat _illuminationNormalize(
     cv.Mat image,
     cv.Mat background,
   ) {
-    // True local illumination normalization:
-    // normalized = image / background * target.
-    // This is materially better than a global brightness adjustment for
-    // documents photographed under a lamp or near a window.
+    // normalized = image / background * target
     final stats = cv.meanStdDev(background);
     final target = stats.$1.val1.clamp(175.0, 225.0);
 
-    // Add a small floor to avoid unstable division in dark/shadow regions.
-    final backgroundSafe = background.addU8(8);
-    final image32 = image.convertTo(cv.MatType.CV_32FC1);
-    final background32 = backgroundSafe.convertTo(cv.MatType.CV_32FC1);
+    cv.Mat? backgroundSafe;
+    cv.Mat? image32;
+    cv.Mat? background32;
 
     try {
+      // Small floor avoids unstable division in dark/shadow regions.
+      backgroundSafe = background.addU8(8);
+      image32 = image.convertTo(cv.MatType.CV_32FC1);
+      background32 = backgroundSafe.convertTo(cv.MatType.CV_32FC1);
+
       return cv.divide(
         image32,
         background32,
@@ -671,9 +555,9 @@ class PdfService {
       _safeDispose(background32);
     }
   }
+
   static int _adaptiveBlockSize(int width, int height) {
     final shortSide = math.min(width, height);
-
     if (shortSide >= 1800) return 41;
     if (shortSide >= 1200) return 35;
     if (shortSide >= 800) return 31;
@@ -684,10 +568,7 @@ class PdfService {
   // JPEG
   // ==========================================================================
 
-  static Uint8List _encodeJpeg(
-    cv.Mat mat,
-    int quality,
-  ) {
+  static Uint8List _encodeJpeg(cv.Mat mat, int quality) {
     final params = cv.VecI32.fromList([
       cv.IMWRITE_JPEG_QUALITY,
       quality,
@@ -708,7 +589,7 @@ class PdfService {
 
       return bytes;
     } finally {
-      params.dispose();
+      _safeDispose(params);
     }
   }
 
@@ -753,9 +634,7 @@ class PdfService {
   }
 
   static double _rectangleScore(List<cv.Point> p) {
-    // Four cosine-like corner checks.
     double score = 0;
-
     for (int i = 0; i < 4; i++) {
       final a = p[(i + 3) % 4];
       final b = p[i];
@@ -768,16 +647,13 @@ class PdfService {
 
       final dot = abx * cbx + aby * cby;
       final mag = math.sqrt(
-        (abx * abx + aby * aby) *
-            (cbx * cbx + cby * cby),
+        (abx * abx + aby * aby) * (cbx * cbx + cby * cby),
       );
 
       if (mag == 0) continue;
-
       final cosine = (dot / mag).abs();
       score += 1.0 - cosine.clamp(0.0, 1.0);
     }
-
     return score / 4.0;
   }
 
@@ -786,9 +662,6 @@ class PdfService {
     int width,
     int height,
   ) {
-    // Prefer plausible document quads that touch/approach the image boundary
-    // without requiring them to do so. This helps when the paper fills most
-    // of the camera frame, while avoiding a hard border requirement.
     final margin = math.min(width, height) * 0.04;
     int nearBorder = 0;
     for (final point in p) {
@@ -819,18 +692,13 @@ class PdfService {
     try {
       final orientation = decoded.exif.imageIfd.orientation;
 
-      // Most images from already-normalized camera pipelines are orientation 1.
-      // Avoid a needless decode → rotate/copy → JPEG encode → OpenCV decode
-      // round-trip in that common case.
+      // Skip needless decode→rotate→encode→decode round-trip in common case.
       if (orientation == null || orientation == 1) {
         return bytes;
       }
 
       final oriented = img.bakeOrientation(decoded);
-      return img.encodeJpg(
-        oriented,
-        quality: 100,
-      );
+      return img.encodeJpg(oriented, quality: 100);
     } catch (_) {
       return bytes;
     }
@@ -868,11 +736,7 @@ class PdfService {
             contrast: 1.10,
             saturation: 1.02,
           );
-          im = _dartUnsharpMask(
-            im,
-            amount: 0.45,
-            radius: 1,
-          );
+          im = _dartUnsharpMask(im, amount: 0.45, radius: 1);
           break;
 
         case ScanMode.grayscale:
@@ -882,11 +746,7 @@ class PdfService {
             brightness: 1.03,
             contrast: 1.18,
           );
-          im = _dartUnsharpMask(
-            im,
-            amount: 0.60,
-            radius: 1,
-          );
+          im = _dartUnsharpMask(im, amount: 0.60, radius: 1);
           break;
 
         case ScanMode.bw:
@@ -896,18 +756,11 @@ class PdfService {
             brightness: 1.03,
             contrast: 1.12,
           );
-          im = _dartAdaptiveThreshold(
-            im,
-            windowSize: 41,
-            k: 0.13,
-          );
+          im = _dartAdaptiveThreshold(im, windowSize: 41, k: 0.13);
           break;
       }
 
-      return img.encodeJpg(
-        im,
-        quality: jpegQuality,
-      );
+      return img.encodeJpg(im, quality: jpegQuality);
     } catch (_) {
       return null;
     }
@@ -918,38 +771,21 @@ class PdfService {
     double amount = 0.5,
     int radius = 1,
   }) {
-    final blurred = img.gaussianBlur(
-      src,
-      radius: radius,
-    );
-
-    final out = img.Image(
-      width: src.width,
-      height: src.height,
-    );
+    final blurred = img.gaussianBlur(src, radius: radius);
+    final out = img.Image(width: src.width, height: src.height);
 
     for (int y = 0; y < src.height; y++) {
       for (int x = 0; x < src.width; x++) {
         final p = src.getPixel(x, y);
         final b = blurred.getPixel(x, y);
 
-        final r =
-            (p.r + amount * (p.r - b.r))
-                .clamp(0, 255)
-                .round();
-        final g =
-            (p.g + amount * (p.g - b.g))
-                .clamp(0, 255)
-                .round();
-        final bl =
-            (p.b + amount * (p.b - b.b))
-                .clamp(0, 255)
-                .round();
+        final r = (p.r + amount * (p.r - b.r)).clamp(0, 255).round();
+        final g = (p.g + amount * (p.g - b.g)).clamp(0, 255).round();
+        final bl = (p.b + amount * (p.b - b.b)).clamp(0, 255).round();
 
         out.setPixelRgb(x, y, r, g, bl);
       }
     }
-
     return out;
   }
 
@@ -969,12 +805,7 @@ class PdfService {
       int rowSum = 0;
       for (int x = 0; x < w; x++) {
         final p = src.getPixel(x, y);
-        final l =
-            (0.299 * p.r +
-             0.587 * p.g +
-             0.114 * p.b)
-                .round();
-
+        final l = (0.299 * p.r + 0.587 * p.g + 0.114 * p.b).round();
         rowSum += l;
         integral[(y + 1) * stride + x + 1] =
             integral[y * stride + x + 1] + rowSum;
@@ -982,7 +813,6 @@ class PdfService {
     }
 
     final half = windowSize ~/ 2;
-
     for (int y = 0; y < h; y++) {
       for (int x = 0; x < w; x++) {
         final x1 = (x - half).clamp(0, w);
@@ -991,24 +821,18 @@ class PdfService {
         final y2 = (y + half + 1).clamp(0, h);
 
         final count = (x2 - x1) * (y2 - y1);
-        final sum =
-            integral[y2 * stride + x2] -
+        final sum = integral[y2 * stride + x2] -
             integral[y1 * stride + x2] -
             integral[y2 * stride + x1] +
             integral[y1 * stride + x1];
 
         final avg = sum / count;
         final p = src.getPixel(x, y);
-        final l =
-            0.299 * p.r +
-            0.587 * p.g +
-            0.114 * p.b;
-
+        final l = 0.299 * p.r + 0.587 * p.g + 0.114 * p.b;
         final v = l < avg * (1 - k) ? 0 : 255;
         out.setPixelRgb(x, y, v, v, v);
       }
     }
-
     return out;
   }
 
@@ -1016,32 +840,28 @@ class PdfService {
   // RESOURCE HELPERS
   // ==========================================================================
 
+  /// Best-effort dispose. Wrapped in try-catch because:
+  ///  1) Disposing an already-disposed native object throws.
+  ///  2) Not every opencv_dart version exposes `isDisposed` on every type.
+  ///     Checking it can cause a compile error on some versions.
   static void _safeDispose(Object? object) {
+    if (object == null) return;
     try {
-      if (object is cv.Mat && !object.isDisposed) {
+      if (object is cv.Mat) {
         object.dispose();
-      } else if (object is cv.VecPoint && !object.isDisposed) {
+      } else if (object is cv.VecPoint) {
         object.dispose();
-      } else if (object is cv.Contours && !object.isDisposed) {
+      } else if (object is cv.Contours) {
         object.dispose();
-      } else if (object is cv.VecVec4i && !object.isDisposed) {
+      } else if (object is cv.VecVec4i) {
         object.dispose();
-      } else if (object is cv.VecI32 && !object.isDisposed) {
+      } else if (object is cv.VecI32) {
         object.dispose();
-      } else if (object is cv.CLAHE && !object.isDisposed) {
+      } else if (object is cv.CLAHE) {
         object.dispose();
       }
     } catch (_) {
-      // Native resources are best-effort cleanup here.
-    }
-  }
-
-  static void _disposeIfDifferent(
-    cv.Mat candidate,
-    cv.Mat original,
-  ) {
-    if (!identical(candidate, original)) {
-      _safeDispose(candidate);
+      // Already disposed or type not supported — ignore.
     }
   }
 }
