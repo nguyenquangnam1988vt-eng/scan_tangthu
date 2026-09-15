@@ -1,222 +1,988 @@
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
+
 import 'package:flutter/foundation.dart';
 import 'package:image/image.dart' as img;
+import 'package:opencv_dart/opencv.dart' as cv;
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
+
 import '../models/session.dart';
 
+/// Advanced document PDF service.
+///
+/// Pipeline:
+///   1) EXIF orientation
+///   2) OpenCV decode / resize
+///   3) document contour detection
+///   4) perspective correction
+///   5) document enhancement
+///      - bilateral denoise
+///      - CLAHE for grayscale/BW
+///      - local background normalization via division
+///      - adaptive threshold
+///      - morphology cleanup
+///      - controlled unsharp mask
+///   6) JPEG encode
+///   7) A4 PDF
+///
+/// The public API is intentionally kept compatible with the original service.
 class PdfService {
-  /// Ghép ảnh → PDF với chất lượng cao.
-  /// Chạy trong isolate để không block UI.
   static Future<File> createPdf({
     required List<String> imagePaths,
     required String outputPath,
     required ScanMode mode,
-    int jpegQuality = 92,
+    int jpegQuality = 93,
     int maxWidth = 2200,
   }) async {
+    if (imagePaths.isEmpty) {
+      throw ArgumentError('imagePaths không được rỗng.');
+    }
+    if (outputPath.trim().isEmpty) {
+      throw ArgumentError('outputPath không hợp lệ.');
+    }
+
+    final quality = jpegQuality.clamp(88, 97);
+    // 2200 px is roughly 260-300 DPI on A4 and is a good phone/RAM balance.
+    final width = maxWidth.clamp(1600, 2600);
+
     final jpgBytesList = await compute(
       _processImages,
       _ProcessArgs(
         paths: imagePaths,
         mode: mode.index,
-        jpegQuality: jpegQuality,
-        maxWidth: maxWidth,
+        jpegQuality: quality,
+        maxWidth: width,
       ),
     );
 
+    if (jpgBytesList.isEmpty) {
+      throw Exception('Không có ảnh hợp lệ để tạo PDF.');
+    }
+
     final doc = pw.Document(compress: true);
+
     for (final jpg in jpgBytesList) {
+      if (jpg.isEmpty) continue;
       doc.addPage(
         pw.Page(
           pageFormat: PdfPageFormat.a4,
           margin: const pw.EdgeInsets.all(4),
           build: (_) => pw.Center(
-            child: pw.Image(pw.MemoryImage(jpg), fit: pw.BoxFit.contain),
+            child: pw.Image(
+              pw.MemoryImage(jpg),
+              fit: pw.BoxFit.contain,
+            ),
           ),
         ),
       );
     }
 
     final file = File(outputPath);
-    await file.writeAsBytes(await doc.save());
+    await file.writeAsBytes(await doc.save(), flush: true);
     return file;
   }
 
-  // ---------- ISOLATE ENTRYPOINT ----------
   static Future<List<Uint8List>> _processImages(_ProcessArgs args) async {
     final mode = ScanMode.values[args.mode];
     final result = <Uint8List>[];
 
     for (final path in args.paths) {
-      final bytes = await File(path).readAsBytes();
-      var im = img.decodeImage(bytes);
-      if (im == null) continue;
+      try {
+        final file = File(path);
+        if (!await file.exists()) continue;
 
-      // 1. Xoay đúng chiều EXIF
-      im = img.bakeOrientation(im);
+        final bytes = await file.readAsBytes();
+        if (bytes.isEmpty) continue;
 
-      // 2. Resize nếu quá lớn (giữ chi tiết chữ nhỏ)
-      if (im.width > args.maxWidth) {
-        im = img.copyResize(
-          im,
-          width: args.maxWidth,
-          interpolation: img.Interpolation.cubic,
+        // OpenCV does not apply JPEG EXIF orientation for imdecode().
+        // We therefore normalize orientation once with package:image.
+        final orientedBytes = _normalizeExifOrientation(bytes);
+
+        Uint8List? processed;
+
+        // Primary path: OpenCV document scanner.
+        try {
+          processed = _processWithOpenCv(
+            orientedBytes,
+            mode,
+            args.maxWidth,
+            args.jpegQuality,
+          );
+        } catch (_) {
+          processed = null;
+        }
+
+        // Safe fallback: existing pure-Dart pipeline.
+        processed ??= _processWithDartFallback(
+          orientedBytes,
+          mode,
+          args.maxWidth,
+          args.jpegQuality,
         );
+
+        if (processed != null && processed.isNotEmpty) {
+          result.add(processed);
+        }
+      } catch (_) {
+        // One corrupt image must not kill the whole PDF.
+        continue;
       }
-
-      // 3. Tăng chất lượng theo chế độ
-      im = _enhance(im, mode);
-
-      // 4. Encode JPEG chất lượng cao
-      final jpg = img.encodeJpg(im, quality: args.jpegQuality);
-      result.add(jpg);
     }
 
     return result;
   }
 
-  // ---------- PIPELINE XỬ LÝ ẢNH ----------
-  static img.Image _enhance(img.Image src, ScanMode mode) {
-    var im = src;
+  // ==========================================================================
+  // OPEN CV PIPELINE
+  // ==========================================================================
 
-    // Bước 1: Auto-contrast — kéo giãn histogram cho ảnh tươi hơn
-    im = _autoContrast(im);
+  static Uint8List _processWithOpenCv(
+    Uint8List bytes,
+    ScanMode mode,
+    int maxWidth,
+    int jpegQuality,
+  ) {
+    cv.Mat? src;
 
+    try {
+      src = cv.imdecode(bytes, cv.IMREAD_COLOR);
+      if (src.empty) {
+        throw StateError('OpenCV không decode được ảnh.');
+      }
+
+      var work = src;
+
+      // Do the expensive contour search on a much smaller image.
+      // The full-resolution image is retained for final warp.
+      if (work.cols > maxWidth) {
+        final scale = maxWidth / work.cols;
+        final resized = cv.resize(
+          work,
+          (maxWidth, (work.rows * scale).round()),
+          interpolation: cv.INTER_AREA,
+        );
+        work = resized;
+      }
+
+      // If requested width is modest, still cap contour-search image at
+      // around 1200 px. This keeps older iPhones responsive.
+      final detection = _detectDocumentAndWarp(
+        work,
+        maxDetectionWidth: 960,
+      );
+
+      // _detectDocumentAndWarp() returns a Mat in the same scale as work.
+      var corrected = detection ?? work;
+
+      // If detection returned a new Mat, work is no longer needed.
+      if (!identical(corrected, work)) {
+        _safeDispose(work);
+      }
+
+      // Additional enhancement after perspective correction.
+      final beforeEnhance = corrected;
+      corrected = _enhanceOpenCv(
+        corrected,
+        mode,
+      );
+      if (!identical(corrected, beforeEnhance)) {
+        _safeDispose(beforeEnhance);
+      }
+
+      final encoded = _encodeJpeg(
+        corrected,
+        jpegQuality,
+      );
+
+      _safeDispose(corrected);
+      return encoded;
+    } finally {
+      _safeDispose(src);
+    }
+  }
+
+  /// Detect the largest convincing 4-corner document contour.
+  ///
+  /// Important optimization:
+  /// contour detection is done on a reduced image, while the working image is
+  /// already limited to maxWidth. That avoids a full 4K/12MP Canny pass.
+  static cv.Mat? _detectDocumentAndWarp(
+    cv.Mat src, {
+    int maxDetectionWidth = 1200,
+  }) {
+    cv.Mat? small;
+    cv.Mat? gray;
+    cv.Mat? blurred;
+    cv.Mat? edges;
+    cv.Mat? closed;
+    cv.Mat? warped;
+    cv.Mat? kernel;
+
+    try {
+      small = src;
+      double sx = 1.0;
+      double sy = 1.0;
+
+      if (src.cols > maxDetectionWidth) {
+        sx = maxDetectionWidth / src.cols;
+        sy = sx;
+        small = cv.resize(
+          src,
+          (maxDetectionWidth, (src.rows * sy).round()),
+          interpolation: cv.INTER_AREA,
+        );
+      }
+
+      gray = cv.cvtColor(small, cv.COLOR_BGR2GRAY);
+      blurred = cv.gaussianBlur(
+        gray,
+        (5, 5),
+        0,
+      );
+
+      // Canny thresholds are intentionally moderate: document borders can be
+      // weak when the paper is white on a pale table.
+      edges = cv.canny(
+        blurred,
+        45,
+        140,
+        l2gradient: true,
+      );
+
+      // Close small breaks in paper edges.
+      kernel = cv.getStructuringElement(
+        cv.MORPH_RECT,
+        (5, 5),
+      );
+      closed = cv.morphologyEx(
+        edges,
+        cv.MORPH_CLOSE,
+        kernel,
+        iterations: 2,
+      );
+
+      final (contours, hierarchy) = cv.findContours(
+        closed,
+        cv.RETR_EXTERNAL,
+        cv.CHAIN_APPROX_SIMPLE,
+      );
+
+      if (contours.isEmpty) {
+        _safeDispose(contours);
+        _safeDispose(hierarchy);
+        return null;
+      }
+
+      final imageArea = small.cols * small.rows.toDouble();
+      final candidates = <_QuadCandidate>[];
+
+      for (final contour in contours) {
+        final area = cv.contourArea(contour).abs();
+        if (area < imageArea * 0.12) continue;
+
+        final perimeter = cv.arcLength(contour, true);
+        if (perimeter <= 0) continue;
+
+        // Try several approximation strengths. Some camera edges need a
+        // slightly looser epsilon than others.
+        cv.VecPoint? bestApprox;
+        for (final epsRatio in <double>[0.012, 0.018, 0.025, 0.035]) {
+          final approx = cv.approxPolyDP(
+            contour,
+            perimeter * epsRatio,
+            true,
+          );
+          if (approx.length == 4) {
+            bestApprox = approx;
+            break;
+          }
+          _safeDispose(approx);
+        }
+
+        if (bestApprox == null) continue;
+
+        final points = bestApprox.toList();
+        if (points.length != 4) {
+          _safeDispose(bestApprox);
+          continue;
+        }
+
+        final ordered = _orderQuad(points);
+        final rectangleScore = _rectangleScore(ordered);
+        final areaRatio = area / imageArea;
+
+        // Reject tiny/random rectangular contours.
+        if (rectangleScore < 0.50) {
+          _safeDispose(bestApprox);
+          continue;
+        }
+        if (areaRatio < 0.12) {
+          _safeDispose(bestApprox);
+          continue;
+        }
+
+        final borderBonus = _borderCoverageBonus(ordered, small.cols, small.rows);
+        final score =
+            areaRatio * 0.62 +
+            rectangleScore * 0.28 +
+            borderBonus * 0.10;
+
+        candidates.add(
+          _QuadCandidate(
+            points: ordered,
+            score: score,
+            areaRatio: areaRatio,
+          ),
+        );
+
+        _safeDispose(bestApprox);
+      }
+
+      _safeDispose(contours);
+      _safeDispose(hierarchy);
+
+      if (candidates.isEmpty) {
+        return null;
+      }
+
+      candidates.sort((a, b) => b.score.compareTo(a.score));
+      final selected = candidates.first;
+
+      // Scale points back to src dimensions.
+      final srcPoints = selected.points
+          .map(
+            (p) => cv.Point(
+              (p.x / sx).round(),
+              (p.y / sy).round(),
+            ),
+          )
+          .toList();
+
+      // Output dimensions are derived from the measured edges instead of
+      // forcing an A4 aspect ratio. This avoids artificial stretching.
+      final widthTop = _distance(srcPoints[0], srcPoints[1]);
+      final widthBottom = _distance(srcPoints[3], srcPoints[2]);
+      final heightLeft = _distance(srcPoints[0], srcPoints[3]);
+      final heightRight = _distance(srcPoints[1], srcPoints[2]);
+
+      var outWidth = math.max(widthTop, widthBottom).round();
+      var outHeight = math.max(heightLeft, heightRight).round();
+
+      if (outWidth < 300 || outHeight < 300) {
+        return null;
+      }
+
+      // Avoid creating massive mats due to noisy contour geometry.
+      const maxOutputSide = 2600;
+      final maxSide = math.max(outWidth, outHeight);
+      if (maxSide > maxOutputSide) {
+        final scale = maxOutputSide / maxSide;
+        outWidth = (outWidth * scale).round();
+        outHeight = (outHeight * scale).round();
+      }
+
+      // Ensure normal portrait/landscape ordering.
+      final destination = cv.VecPoint.fromList([
+        cv.Point(0, 0),
+        cv.Point(outWidth - 1, 0),
+        cv.Point(outWidth - 1, outHeight - 1),
+        cv.Point(0, outHeight - 1),
+      ]);
+
+      final source = cv.VecPoint.fromList(srcPoints);
+      final transform = cv.getPerspectiveTransform(
+        source,
+        destination,
+      );
+
+      warped = cv.warpPerspective(
+        src,
+        transform,
+        (outWidth, outHeight),
+        flags: cv.INTER_CUBIC,
+        borderMode: cv.BORDER_REPLICATE,
+      );
+
+      _safeDispose(transform);
+      _safeDispose(source);
+      _safeDispose(destination);
+
+      return warped;
+    } finally {
+      if (!identical(small, src)) _safeDispose(small);
+      _safeDispose(gray);
+      _safeDispose(blurred);
+      _safeDispose(edges);
+      _safeDispose(closed);
+      _safeDispose(kernel);
+      // Do not dispose warped here: it is returned to caller.
+    }
+  }
+
+  // ==========================================================================
+  // OPENCV ENHANCEMENT
+  // ==========================================================================
+
+  static cv.Mat _enhanceOpenCv(
+    cv.Mat src,
+    ScanMode mode,
+  ) {
     switch (mode) {
       case ScanMode.color:
-        // Màu: tăng sáng nhẹ + tương phản + làm nét vừa
-        im = img.adjustColor(
-          im,
-          brightness: 1.06,
-          contrast: 1.20,
-          saturation: 1.05,
-        );
-        im = _unsharpMask(im, amount: 0.7, radius: 1);
-        return im;
-
+        return _enhanceColor(src);
       case ScanMode.grayscale:
-        // Xám: chuyển xám + tăng tương phản mạnh + làm nét rõ
-        im = img.grayscale(im);
-        im = img.adjustColor(
-          im,
-          brightness: 1.10,
-          contrast: 1.40,
-        );
-        im = _unsharpMask(im, amount: 0.9, radius: 1);
-        return im;
-
+        return _enhanceGrayscale(src);
       case ScanMode.bw:
-        // Đen trắng: adaptive threshold — chữ rất nét, không vỡ
-        im = img.grayscale(im);
-        im = img.adjustColor(im, brightness: 1.08, contrast: 1.25);
-        im = _adaptiveThreshold(im, windowSize: 35, k: 0.15);
-        return im;
+        return _enhanceBlackWhite(src);
     }
   }
 
-  // ---------- AUTO CONTRAST ----------
-  /// Kéo giãn histogram: đưa mức sáng/tối về 0-255.
-  static img.Image _autoContrast(img.Image src, {double clip = 0.005}) {
-    // Đếm histogram độ sáng
-    final hist = List<int>.filled(256, 0);
-    for (final p in src) {
-      final l = (0.299 * p.r + 0.587 * p.g + 0.114 * p.b).round();
-      hist[l.clamp(0, 255)]++;
+  static cv.Mat _enhanceColor(cv.Mat src) {
+    cv.Mat? denoised;
+    cv.Mat? adjusted;
+    cv.Mat? blur;
+    cv.Mat? sharpen;
+
+    try {
+      // Bilateral filtering keeps document edges while reducing camera noise.
+      denoised = cv.bilateralFilter(
+        src,
+        5,
+        35,
+        35,
+      );
+
+      // Gentle contrast/brightness correction.
+      adjusted = cv.convertScaleAbs(
+        denoised,
+        alpha: 1.06,
+        beta: 2,
+      );
+
+      // Controlled unsharp mask.
+      blur = cv.gaussianBlur(
+        adjusted,
+        (0, 0),
+        1.1,
+      );
+      sharpen = cv.addWeighted(
+        adjusted,
+        1.25,
+        blur,
+        -0.25,
+        0,
+      );
+
+      return sharpen;
+    } finally {
+      _safeDispose(denoised);
+      _safeDispose(adjusted);
+      _safeDispose(blur);
+      // sharpen intentionally returned.
     }
-
-    final total = src.width * src.height;
-    final cut = (total * clip).round();
-
-    // Tìm ngưỡng thấp
-    int low = 0, sum = 0;
-    for (int i = 0; i < 256; i++) {
-      sum += hist[i];
-      if (sum > cut) {
-        low = i;
-        break;
-      }
-    }
-
-    // Tìm ngưỡng cao
-    int high = 255;
-    sum = 0;
-    for (int i = 255; i >= 0; i--) {
-      sum += hist[i];
-      if (sum > cut) {
-        high = i;
-        break;
-      }
-    }
-
-    if (high <= low) return src;
-    final scale = 255.0 / (high - low);
-
-    final out = img.Image(width: src.width, height: src.height);
-    for (final p in src) {
-      final nr = ((p.r - low) * scale).clamp(0, 255).toInt();
-      final ng = ((p.g - low) * scale).clamp(0, 255).toInt();
-      final nb = ((p.b - low) * scale).clamp(0, 255).toInt();
-      out.setPixelRgb(p.x, p.y, nr, ng, nb);
-    }
-    return out;
   }
 
-  // ---------- UNSHARP MASK ----------
-  /// Làm nét kiểu "Unsharp Mask": ảnh gốc + hệ số * (gốc - blur).
-  static img.Image _unsharpMask(
+  static cv.Mat _enhanceGrayscale(cv.Mat src) {
+    cv.Mat? gray;
+    cv.Mat? denoised;
+    cv.Mat? claheOut;
+    cv.Mat? localBackground;
+    cv.Mat? normalized;
+    cv.Mat? blur;
+    cv.Mat? sharpen;
+    cv.CLAHE? clahe;
+
+    try {
+      gray = cv.cvtColor(src, cv.COLOR_BGR2GRAY);
+
+      denoised = cv.bilateralFilter(
+        gray,
+        5,
+        30,
+        30,
+      );
+
+      // CLAHE gives local contrast without the aggressive global histogram
+      // stretching of the original implementation.
+      clahe = cv.createCLAHE(
+        clipLimit: 1.8,
+        tileGridSize: (8, 8),
+      );
+      claheOut = clahe.apply(denoised);
+
+      // Illumination correction: divide image by a blurred background.
+      // This reduces shadows and uneven room lighting on the paper.
+      localBackground = cv.gaussianBlur(
+        claheOut,
+        (0, 0),
+        19,
+      );
+
+      normalized = _illuminationNormalize(
+        claheOut,
+        localBackground,
+      );
+
+      blur = cv.gaussianBlur(
+        normalized,
+        (0, 0),
+        1.0,
+      );
+
+      sharpen = cv.addWeighted(
+        normalized,
+        1.24,
+        blur,
+        -0.24,
+        0,
+      );
+
+      return sharpen;
+    } finally {
+      clahe?.dispose();
+      _safeDispose(gray);
+      _safeDispose(denoised);
+      _safeDispose(claheOut);
+      _safeDispose(localBackground);
+      _safeDispose(normalized);
+      _safeDispose(blur);
+      // sharpen intentionally returned.
+    }
+  }
+
+  static cv.Mat _enhanceBlackWhite(cv.Mat src) {
+    cv.Mat? gray;
+    cv.Mat? denoised;
+    cv.Mat? claheOut;
+    cv.Mat? background;
+    cv.Mat? normalized;
+    cv.Mat? binary;
+    cv.Mat? clean;
+    cv.Mat? kernelClose;
+    cv.CLAHE? clahe;
+
+    try {
+      gray = cv.cvtColor(src, cv.COLOR_BGR2GRAY);
+
+      // Bilateral preserves letter edges better than a large Gaussian blur.
+      denoised = cv.bilateralFilter(
+        gray,
+        5,
+        25,
+        25,
+      );
+
+      clahe = cv.createCLAHE(
+        clipLimit: 1.8,
+        tileGridSize: (8, 8),
+      );
+      claheOut = clahe.apply(denoised);
+
+      // Remove slow-varying illumination before thresholding.
+      background = cv.gaussianBlur(
+        claheOut,
+        (0, 0),
+        15,
+      );
+      normalized = _illuminationNormalize(
+        claheOut,
+        background,
+      );
+
+      // Adaptive threshold is the key difference from a global threshold.
+      // Odd block size is required by OpenCV.
+      var blockSize = _adaptiveBlockSize(
+        normalized.cols,
+        normalized.rows,
+      );
+
+      binary = cv.adaptiveThreshold(
+        normalized,
+        255,
+        cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv.THRESH_BINARY,
+        blockSize,
+        10,
+      );
+
+      // Close tiny gaps in characters, then remove isolated speckles.
+      kernelClose = cv.getStructuringElement(
+        cv.MORPH_RECT,
+        (3, 3),
+      );
+      clean = cv.morphologyEx(
+        binary,
+        cv.MORPH_CLOSE,
+        kernelClose,
+        iterations: 1,
+      );
+
+      // Do not apply MORPH_OPEN by default: on phone photos it can erase
+      // thin strokes, punctuation and Vietnamese diacritics. The 3x3 close
+      // above is enough to reconnect tiny breaks while preserving character
+      // detail.
+      return clean;
+    } finally {
+      clahe?.dispose();
+      _safeDispose(gray);
+      _safeDispose(denoised);
+      _safeDispose(claheOut);
+      _safeDispose(background);
+      _safeDispose(normalized);
+      _safeDispose(binary);
+      _safeDispose(kernelClose);
+      // clean intentionally returned.
+    }
+  }
+
+  /// Normalize a document illuminated by a non-uniform light field.
+  ///
+  /// Estimates slow-changing illumination from a heavily blurred background
+  /// and divides the document image by that field. This is more robust than
+  /// global brightness/contrast when the phone is lit from one side.
+  static cv.Mat _illuminationNormalize(
+    cv.Mat image,
+    cv.Mat background,
+  ) {
+    // True local illumination normalization:
+    // normalized = image / background * target.
+    // This is materially better than a global brightness adjustment for
+    // documents photographed under a lamp or near a window.
+    final stats = cv.meanStdDev(background);
+    final target = stats.$1.val1.clamp(175.0, 225.0);
+
+    // Add a small floor to avoid unstable division in dark/shadow regions.
+    final backgroundSafe = background.addU8(8);
+    final image32 = image.convertTo(cv.MatType.CV_32FC1);
+    final background32 = backgroundSafe.convertTo(cv.MatType.CV_32FC1);
+
+    try {
+      return cv.divide(
+        image32,
+        background32,
+        scale: target,
+        dtype: cv.CV_8UC1,
+      );
+    } finally {
+      _safeDispose(backgroundSafe);
+      _safeDispose(image32);
+      _safeDispose(background32);
+    }
+  }
+  static int _adaptiveBlockSize(int width, int height) {
+    final shortSide = math.min(width, height);
+
+    if (shortSide >= 1800) return 41;
+    if (shortSide >= 1200) return 35;
+    if (shortSide >= 800) return 31;
+    return 25;
+  }
+
+  // ==========================================================================
+  // JPEG
+  // ==========================================================================
+
+  static Uint8List _encodeJpeg(
+    cv.Mat mat,
+    int quality,
+  ) {
+    final params = cv.VecI32.fromList([
+      cv.IMWRITE_JPEG_QUALITY,
+      quality,
+      cv.IMWRITE_JPEG_OPTIMIZE,
+      1,
+    ]);
+
+    try {
+      final (ok, bytes) = cv.imencode(
+        '.jpg',
+        mat,
+        params: params,
+      );
+
+      if (!ok || bytes.isEmpty) {
+        throw StateError('Không encode JPEG được.');
+      }
+
+      return bytes;
+    } finally {
+      params.dispose();
+    }
+  }
+
+  // ==========================================================================
+  // GEOMETRY
+  // ==========================================================================
+
+  static List<cv.Point> _orderQuad(List<cv.Point> points) {
+    cv.Point? tl;
+    cv.Point? tr;
+    cv.Point? br;
+    cv.Point? bl;
+
+    var minSum = double.infinity;
+    var maxSum = -double.infinity;
+    var minDiff = double.infinity;
+    var maxDiff = -double.infinity;
+
+    for (final p in points) {
+      final sum = p.x + p.y.toDouble();
+      final diff = p.x - p.y.toDouble();
+
+      if (sum < minSum) {
+        minSum = sum;
+        tl = p;
+      }
+      if (sum > maxSum) {
+        maxSum = sum;
+        br = p;
+      }
+      if (diff < minDiff) {
+        minDiff = diff;
+        bl = p;
+      }
+      if (diff > maxDiff) {
+        maxDiff = diff;
+        tr = p;
+      }
+    }
+
+    return [tl!, tr!, br!, bl!];
+  }
+
+  static double _rectangleScore(List<cv.Point> p) {
+    // Four cosine-like corner checks.
+    double score = 0;
+
+    for (int i = 0; i < 4; i++) {
+      final a = p[(i + 3) % 4];
+      final b = p[i];
+      final c = p[(i + 1) % 4];
+
+      final abx = a.x - b.x;
+      final aby = a.y - b.y;
+      final cbx = c.x - b.x;
+      final cby = c.y - b.y;
+
+      final dot = abx * cbx + aby * cby;
+      final mag = math.sqrt(
+        (abx * abx + aby * aby) *
+            (cbx * cbx + cby * cby),
+      );
+
+      if (mag == 0) continue;
+
+      final cosine = (dot / mag).abs();
+      score += 1.0 - cosine.clamp(0.0, 1.0);
+    }
+
+    return score / 4.0;
+  }
+
+  static double _borderCoverageBonus(
+    List<cv.Point> p,
+    int width,
+    int height,
+  ) {
+    // Prefer plausible document quads that touch/approach the image boundary
+    // without requiring them to do so. This helps when the paper fills most
+    // of the camera frame, while avoiding a hard border requirement.
+    final margin = math.min(width, height) * 0.04;
+    int nearBorder = 0;
+    for (final point in p) {
+      if (point.x <= margin ||
+          point.y <= margin ||
+          point.x >= width - margin ||
+          point.y >= height - margin) {
+        nearBorder++;
+      }
+    }
+    return nearBorder / 4.0;
+  }
+
+  static double _distance(cv.Point a, cv.Point b) {
+    final dx = (a.x - b.x).toDouble();
+    final dy = (a.y - b.y).toDouble();
+    return math.sqrt(dx * dx + dy * dy);
+  }
+
+  // ==========================================================================
+  // EXIF ORIENTATION NORMALIZATION
+  // ==========================================================================
+
+  static Uint8List _normalizeExifOrientation(Uint8List bytes) {
+    final decoded = img.decodeImage(bytes);
+    if (decoded == null) return bytes;
+
+    try {
+      final orientation = decoded.exif.imageIfd.orientation;
+
+      // Most images from already-normalized camera pipelines are orientation 1.
+      // Avoid a needless decode → rotate/copy → JPEG encode → OpenCV decode
+      // round-trip in that common case.
+      if (orientation == null || orientation == 1) {
+        return bytes;
+      }
+
+      final oriented = img.bakeOrientation(decoded);
+      return img.encodeJpg(
+        oriented,
+        quality: 100,
+      );
+    } catch (_) {
+      return bytes;
+    }
+  }
+
+  // ==========================================================================
+  // PURE DART FALLBACK
+  // ==========================================================================
+
+  static Uint8List? _processWithDartFallback(
+    Uint8List bytes,
+    ScanMode mode,
+    int maxWidth,
+    int jpegQuality,
+  ) {
+    try {
+      var im = img.decodeImage(bytes);
+      if (im == null) return null;
+
+      im = img.bakeOrientation(im);
+
+      if (im.width > maxWidth) {
+        im = img.copyResize(
+          im,
+          width: maxWidth,
+          interpolation: img.Interpolation.cubic,
+        );
+      }
+
+      switch (mode) {
+        case ScanMode.color:
+          im = img.adjustColor(
+            im,
+            brightness: 1.02,
+            contrast: 1.10,
+            saturation: 1.02,
+          );
+          im = _dartUnsharpMask(
+            im,
+            amount: 0.45,
+            radius: 1,
+          );
+          break;
+
+        case ScanMode.grayscale:
+          im = img.grayscale(im);
+          im = img.adjustColor(
+            im,
+            brightness: 1.03,
+            contrast: 1.18,
+          );
+          im = _dartUnsharpMask(
+            im,
+            amount: 0.60,
+            radius: 1,
+          );
+          break;
+
+        case ScanMode.bw:
+          im = img.grayscale(im);
+          im = img.adjustColor(
+            im,
+            brightness: 1.03,
+            contrast: 1.12,
+          );
+          im = _dartAdaptiveThreshold(
+            im,
+            windowSize: 41,
+            k: 0.13,
+          );
+          break;
+      }
+
+      return img.encodeJpg(
+        im,
+        quality: jpegQuality,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static img.Image _dartUnsharpMask(
     img.Image src, {
-    double amount = 0.8,
+    double amount = 0.5,
     int radius = 1,
   }) {
-    final blurred = img.gaussianBlur(src, radius: radius);
-    final out = img.Image(width: src.width, height: src.height);
+    final blurred = img.gaussianBlur(
+      src,
+      radius: radius,
+    );
+
+    final out = img.Image(
+      width: src.width,
+      height: src.height,
+    );
 
     for (int y = 0; y < src.height; y++) {
       for (int x = 0; x < src.width; x++) {
         final p = src.getPixel(x, y);
         final b = blurred.getPixel(x, y);
 
-        final r = (p.r + amount * (p.r - b.r)).clamp(0, 255).toInt();
-        final g = (p.g + amount * (p.g - b.g)).clamp(0, 255).toInt();
-        final bl = (p.b + amount * (p.b - b.b)).clamp(0, 255).toInt();
+        final r =
+            (p.r + amount * (p.r - b.r))
+                .clamp(0, 255)
+                .round();
+        final g =
+            (p.g + amount * (p.g - b.g))
+                .clamp(0, 255)
+                .round();
+        final bl =
+            (p.b + amount * (p.b - b.b))
+                .clamp(0, 255)
+                .round();
 
         out.setPixelRgb(x, y, r, g, bl);
       }
     }
+
     return out;
   }
 
-  // ---------- ADAPTIVE THRESHOLD (BRADLEY) ----------
-  /// Ngưỡng đen trắng động theo vùng — chữ rất nét, không vỡ như threshold cố định.
-  /// [windowSize] kích thước cửa sổ điểm ảnh, [k] hệ số điều chỉnh (0.1–0.2).
-  static img.Image _adaptiveThreshold(
+  static img.Image _dartAdaptiveThreshold(
     img.Image src, {
-    int windowSize = 35,
-    double k = 0.15,
+    int windowSize = 41,
+    double k = 0.13,
   }) {
-    final w = src.width, h = src.height;
+    final w = src.width;
+    final h = src.height;
     final out = img.Image(width: w, height: h);
 
-    // 1. Tính Integral Image (tổng lũy tích) — truy vấn tổng vùng O(1)
-    final integral = List.generate(
-      h + 1,
-      (_) => List<int>.filled(w + 1, 0),
-      growable: false,
-    );
+    final stride = w + 1;
+    final integral = Uint32List((h + 1) * stride);
 
     for (int y = 0; y < h; y++) {
       int rowSum = 0;
       for (int x = 0; x < w; x++) {
         final p = src.getPixel(x, y);
-        final l = (0.299 * p.r + 0.587 * p.g + 0.114 * p.b).round();
+        final l =
+            (0.299 * p.r +
+             0.587 * p.g +
+             0.114 * p.b)
+                .round();
+
         rowSum += l;
-        integral[y + 1][x + 1] = integral[y][x + 1] + rowSum;
+        integral[(y + 1) * stride + x + 1] =
+            integral[y * stride + x + 1] + rowSum;
       }
     }
 
-    // 2. Duyệt từng pixel, so sánh với trung bình vùng
     final half = windowSize ~/ 2;
+
     for (int y = 0; y < h; y++) {
       for (int x = 0; x < w; x++) {
         final x1 = (x - half).clamp(0, w);
@@ -225,32 +991,80 @@ class PdfService {
         final y2 = (y + half + 1).clamp(0, h);
 
         final count = (x2 - x1) * (y2 - y1);
-        final sum = integral[y2][x2] -
-            integral[y1][x2] -
-            integral[y2][x1] +
-            integral[y1][x1];
+        final sum =
+            integral[y2 * stride + x2] -
+            integral[y1 * stride + x2] -
+            integral[y2 * stride + x1] +
+            integral[y1 * stride + x1];
+
         final avg = sum / count;
-
         final p = src.getPixel(x, y);
-        final l = (0.299 * p.r + 0.587 * p.g + 0.114 * p.b);
+        final l =
+            0.299 * p.r +
+            0.587 * p.g +
+            0.114 * p.b;
 
-        // Pixel tối hơn (1-k) lần trung bình → đen, ngược lại → trắng
         final v = l < avg * (1 - k) ? 0 : 255;
         out.setPixelRgb(x, y, v, v, v);
       }
     }
+
     return out;
+  }
+
+  // ==========================================================================
+  // RESOURCE HELPERS
+  // ==========================================================================
+
+  static void _safeDispose(Object? object) {
+    try {
+      if (object is cv.Mat && !object.isDisposed) {
+        object.dispose();
+      } else if (object is cv.VecPoint && !object.isDisposed) {
+        object.dispose();
+      } else if (object is cv.Contours && !object.isDisposed) {
+        object.dispose();
+      } else if (object is cv.VecVec4i && !object.isDisposed) {
+        object.dispose();
+      } else if (object is cv.VecI32 && !object.isDisposed) {
+        object.dispose();
+      } else if (object is cv.CLAHE && !object.isDisposed) {
+        object.dispose();
+      }
+    } catch (_) {
+      // Native resources are best-effort cleanup here.
+    }
+  }
+
+  static void _disposeIfDifferent(
+    cv.Mat candidate,
+    cv.Mat original,
+  ) {
+    if (!identical(candidate, original)) {
+      _safeDispose(candidate);
+    }
   }
 }
 
-// ---------- ARGS CHO ISOLATE ----------
+class _QuadCandidate {
+  final List<cv.Point> points;
+  final double score;
+  final double areaRatio;
+
+  const _QuadCandidate({
+    required this.points,
+    required this.score,
+    required this.areaRatio,
+  });
+}
+
 class _ProcessArgs {
   final List<String> paths;
   final int mode;
   final int jpegQuality;
   final int maxWidth;
 
-  _ProcessArgs({
+  const _ProcessArgs({
     required this.paths,
     required this.mode,
     required this.jpegQuality,
