@@ -8,7 +8,6 @@ import '../services/pdf_service.dart';
 import '../services/export_service.dart';
 import '../utils/dialogs.dart';
 import 'pdf_preview_screen.dart';
-import '../utils/suggestions.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -155,10 +154,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // ---------- THỦ TỤC ----------
   Future<void> _addProcedure(PersonEntry p) async {
-    final name = await askProcedureName(
-      context,
-      groups: ProcedureSuggestions.groups,
-    );
+    final name = await askProcedureName(context);
     if (name == null || name.trim().isEmpty) return;
     final n = name.trim();
     if (p.procedures.any((x) => x.name == n)) {
