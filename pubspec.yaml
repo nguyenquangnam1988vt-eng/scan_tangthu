@@ -18,7 +18,6 @@ dependencies:
   archive: ^4.0.0
   share_plus: ^7.2.2
   file_picker: ^8.0.0
-  opencv_dart: ^1.4.5
 
 dev_dependencies:
   flutter_lints: ^3.0.0
