@@ -5,7 +5,12 @@ import 'package:share_plus/share_plus.dart';
 import 'session_service.dart';
 
 class ExportService {
-  static Future<ShareResult> shareCase(String caseName) async {
+  /// Nén thư mục hồ sơ thành ZIP rồi mở share sheet.
+  /// Nếu [password] != null và không rỗng → mã hóa AES-256.
+  static Future<void> shareCase(
+    String caseName, {
+    String? password,
+  }) async {
     final caseDir = await SessionService.getCaseDir(caseName);
     if (!await caseDir.exists()) {
       throw Exception('Hồ sơ chưa có file nào');
@@ -17,21 +22,27 @@ class ExportService {
     final zipFile = File(zipPath);
     if (await zipFile.exists()) await zipFile.delete();
 
-    final encoder = ZipFileEncoder();
+    final hasPassword = password != null && password.trim().isNotEmpty;
+
+    // archive 4.x: password truyền vào constructor của ZipFileEncoder
+    final encoder = hasPassword
+        ? ZipFileEncoder(password: password)
+        : ZipFileEncoder();
+
     encoder.create(zipPath);
     await encoder.addDirectory(caseDir, includeDirName: true);
-    await encoder.close();
+    encoder.close();
 
-    final result = await Share.shareXFiles(
+    await Share.shareXFiles(
       [XFile(zipPath, mimeType: 'application/zip')],
       subject: safeName,
-      text: 'Hồ sơ: $safeName',
+      text: hasPassword
+          ? 'Hồ sơ: $safeName (đã bảo vệ bằng mật khẩu)'
+          : 'Hồ sơ: $safeName',
     );
 
     try {
       await zipFile.delete();
     } catch (_) {}
-
-    return result;
   }
 }
