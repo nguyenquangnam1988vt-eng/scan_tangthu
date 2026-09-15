@@ -60,41 +60,57 @@ Future<bool> confirm(
   return r ?? false;
 }
 
-/// Dialog chọn tên thủ tục: gõ vào ô tìm kiếm → gợi ý hiện ra → chạm để chọn.
+/// Dialog chọn tên thủ tục (thư mục) — giữ đơn giản, chỉ gõ tay.
 Future<String?> askProcedureName(BuildContext ctx) async {
-  final nameCtrl = TextEditingController();
+  return askText(
+    ctx,
+    title: 'Tên thủ tục (thư mục)',
+    hint: 'vd: KhaiSinh, CMND, HoKhau, ToKhaiCT01',
+    okLabel: 'Tạo thủ tục',
+  );
+}
+
+/// ⭐ Dialog đặt tên file PDF sau khi scan.
+/// Có gợi ý: gõ từ khoá → hiện danh sách tài liệu → chọn.
+/// Vẫn có thể gõ tay tự do.
+Future<({String name, ScanMode mode})?> askScanOptions(
+  BuildContext ctx, {
+  required String defaultName,
+}) async {
+  final nameCtrl = TextEditingController(text: defaultName);
   final searchCtrl = TextEditingController();
   List<String> filtered = ProcedureSuggestions.all;
+  ScanMode mode = ScanMode.grayscale;
 
-  return showDialog<String>(
+  return showDialog<({String name, ScanMode mode})>(
     context: ctx,
     builder: (dialogCtx) => StatefulBuilder(
       builder: (_, setLocal) => AlertDialog(
-        title: const Text('Chọn tên thủ tục'),
+        title: const Text('Lưu file PDF'),
         contentPadding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
         content: SizedBox(
           width: double.maxFinite,
-          height: 480,
+          height: 620,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // Ô tên cuối cùng
+              // ---- Ô tên file ----
               TextField(
                 controller: nameCtrl,
+                autofocus: true,
                 textCapitalization: TextCapitalization.sentences,
                 decoration: const InputDecoration(
-                  labelText: 'Tên thủ tục',
-                  hintText: 'Gõ tên hoặc chọn bên dưới',
-                  prefixIcon: Icon(Icons.drive_file_rename_outline),
+                  labelText: 'Tên file',
+                  hintText: 'Gõ hoặc chọn gợi ý bên dưới',
+                  prefixIcon: Icon(Icons.picture_as_pdf),
                   border: OutlineInputBorder(),
                 ),
               ),
               const SizedBox(height: 10),
 
-              // Ô tìm kiếm
+              // ---- Ô tìm kiếm gợi ý ----
               TextField(
                 controller: searchCtrl,
-                autofocus: true,
                 onChanged: (v) => setLocal(() {
                   filtered = ProcedureSuggestions.search(v);
                 }),
@@ -118,11 +134,14 @@ Future<String?> askProcedureName(BuildContext ctx) async {
               ),
               const SizedBox(height: 8),
 
-              // Danh sách gợi ý
+              // ---- Danh sách gợi ý ----
               Expanded(
                 child: filtered.isEmpty
                     ? const Center(
-                        child: Text('Không có gợi ý — hãy gõ tay ở ô trên'),
+                        child: Text(
+                          'Không có gợi ý — hãy gõ tay ở ô trên',
+                          style: TextStyle(fontSize: 12),
+                        ),
                       )
                     : ListView.builder(
                         itemCount: filtered.length,
@@ -146,83 +165,54 @@ Future<String?> askProcedureName(BuildContext ctx) async {
                         },
                       ),
               ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx),
-            child: const Text('Huỷ'),
-          ),
-          FilledButton(
-            onPressed: () {
-              final name = nameCtrl.text.trim();
-              if (name.isEmpty) return;
-              Navigator.pop(dialogCtx, name);
-            },
-            child: const Text('Thêm'),
-          ),
-        ],
-      ),
-    ),
-  );
-}
 
-/// Dialog chọn chế độ quét + đặt tên file.
-Future<({String name, ScanMode mode})?> askScanOptions(
-  BuildContext ctx, {
-  required String defaultName,
-}) async {
-  final ctrl = TextEditingController(text: defaultName);
-  ScanMode mode = ScanMode.grayscale;
+              const Divider(height: 1),
+              const SizedBox(height: 8),
 
-  return showDialog<({String name, ScanMode mode})>(
-    context: ctx,
-    builder: (dialogCtx) => StatefulBuilder(
-      builder: (_, setLocal) => AlertDialog(
-        title: const Text('Lưu file PDF'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              TextField(
-                controller: ctrl,
-                autofocus: true,
-                decoration: const InputDecoration(
-                  labelText: 'Tên file',
-                  hintText: 'vd: CMND_mat_truoc',
+              // ---- Chọn chế độ quét ----
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Chế độ quét:',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w600, fontSize: 13),
                 ),
               ),
-              const SizedBox(height: 18),
-              const Text('Chế độ quét:',
-                  style: TextStyle(
-                      fontWeight: FontWeight.w600, fontSize: 13)),
-              const SizedBox(height: 8),
-              _modeRadio(
-                label: 'Màu gốc',
-                sub: 'Giữ màu — sổ đỏ, hóa đơn',
-                icon: Icons.palette_outlined,
-                value: ScanMode.color,
-                groupValue: mode,
-                onChanged: (v) => setLocal(() => mode = v),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: _modeChip(
+                      label: 'Màu',
+                      icon: Icons.palette_outlined,
+                      value: ScanMode.color,
+                      groupValue: mode,
+                      onChanged: (v) => setLocal(() => mode = v),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: _modeChip(
+                      label: 'Xám',
+                      icon: Icons.gradient_outlined,
+                      value: ScanMode.grayscale,
+                      groupValue: mode,
+                      onChanged: (v) => setLocal(() => mode = v),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: _modeChip(
+                      label: 'Đen trắng',
+                      icon: Icons.contrast,
+                      value: ScanMode.bw,
+                      groupValue: mode,
+                      onChanged: (v) => setLocal(() => mode = v),
+                    ),
+                  ),
+                ],
               ),
-              _modeRadio(
-                label: 'Xám (khuyên dùng)',
-                sub: 'Nhẹ hơn 40%, chữ rõ',
-                icon: Icons.gradient_outlined,
-                value: ScanMode.grayscale,
-                groupValue: mode,
-                onChanged: (v) => setLocal(() => mode = v),
-              ),
-              _modeRadio(
-                label: 'Đen trắng',
-                sub: 'Nhẹ nhất, tài liệu in',
-                icon: Icons.contrast,
-                value: ScanMode.bw,
-                groupValue: mode,
-                onChanged: (v) => setLocal(() => mode = v),
-              ),
+              const SizedBox(height: 4),
             ],
           ),
         ),
@@ -231,10 +221,14 @@ Future<({String name, ScanMode mode})?> askScanOptions(
               onPressed: () => Navigator.pop(dialogCtx),
               child: const Text('Huỷ')),
           FilledButton(
-            onPressed: () => Navigator.pop(
-              dialogCtx,
-              (name: ctrl.text.trim(), mode: mode),
-            ),
+            onPressed: () {
+              final name = nameCtrl.text.trim();
+              if (name.isEmpty) return;
+              Navigator.pop(
+                dialogCtx,
+                (name: name, mode: mode),
+              );
+            },
             child: const Text('Tạo PDF'),
           ),
         ],
@@ -243,9 +237,9 @@ Future<({String name, ScanMode mode})?> askScanOptions(
   );
 }
 
-Widget _modeRadio({
+/// Chip chọn chế độ quét — gọn hơn Radio.
+Widget _modeChip({
   required String label,
-  required String sub,
   required IconData icon,
   required ScanMode value,
   required ScanMode groupValue,
@@ -256,42 +250,31 @@ Widget _modeRadio({
     onTap: () => onChanged(value),
     borderRadius: BorderRadius.circular(8),
     child: Container(
-      margin: const EdgeInsets.only(bottom: 4),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
       decoration: BoxDecoration(
         color: selected
-            ? Colors.blue.withValues(alpha: 0.10)
-            : Colors.transparent,
+            ? Colors.blue.withValues(alpha: 0.15)
+            : Colors.grey.shade100,
         border: Border.all(
           color: selected ? Colors.blue : Colors.grey.shade300,
           width: selected ? 1.5 : 1,
         ),
         borderRadius: BorderRadius.circular(8),
       ),
-      child: Row(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
           Icon(icon,
               size: 20,
-              color: selected ? Colors.blue : Colors.grey.shade600),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(label,
-                    style: const TextStyle(
-                        fontWeight: FontWeight.w600, fontSize: 13)),
-                Text(sub,
-                    style: TextStyle(
-                        fontSize: 11, color: Colors.grey.shade600)),
-              ],
+              color: selected ? Colors.blue.shade800 : Colors.grey.shade600),
+          const SizedBox(height: 4),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+              color: selected ? Colors.blue.shade800 : Colors.grey.shade700,
             ),
-          ),
-          Radio<ScanMode>(
-            value: value,
-            groupValue: groupValue,
-            onChanged: (v) => onChanged(v ?? value),
-            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
           ),
         ],
       ),
