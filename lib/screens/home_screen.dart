@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter_better_scanner/flutter_better_scanner.dart';
 import '../models/session.dart';
 import '../services/session_service.dart';
-import '../services/scanner_service.dart';
 import '../services/pdf_service.dart';
 import '../services/export_service.dart';
 import '../utils/dialogs.dart';
@@ -23,7 +23,7 @@ class _HomeScreenState extends State<HomeScreen> {
   late TextEditingController _caseCtrl;
   Timer? _caseDebounce;
 
-  // 🔐 Mật khẩu cho phiên làm việc — chỉ ở RAM, tắt app là mất
+  // Mật khẩu cho phiên làm việc — chỉ ở RAM, tắt app là mất
   String? _sessionPassword;
 
   @override
@@ -75,7 +75,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // ---------- MẬT KHẨU PHIÊN ----------
   Future<void> _openPasswordDialog() async {
     final result = await askPassword(context, current: _sessionPassword);
-    if (result == null) return; // Huỷ
+    if (result == null) return;
     setState(() {
       _sessionPassword = result.isEmpty ? null : result;
     });
@@ -198,7 +198,7 @@ class _HomeScreenState extends State<HomeScreen> {
     await _save();
   }
 
-  // ---------- QUÉT ----------
+  // ---------- QUÉT (dùng flutter_better_scanner) ----------
   Future<void> _scan(PersonEntry p, ProcedureEntry pr) async {
     if (_busy) return;
     if (_session.caseName.isEmpty) {
@@ -206,26 +206,38 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    List<String>? images;
+    setState(() => _busy = true);
     try {
-      images = await ScannerService.scan();
-      if (images == null || images.isEmpty) return;
+      // 1. Mở giao diện scanner tích hợp — tự crop + enhance + filter.
+      final result = await BetterScanner.openScanner(
+        context,
+        config: const ScannerConfig(
+          captureMode: CaptureMode.multiple,
+          shutterMode: ShutterMode.manual,
+          autoCrop: true,
+          autoEnhance: true,
+          enhancement: ScanEnhancement.magicColor,
+          exportFormat: ExportFormat.jpg,
+        ),
+      );
 
+      if (result == null || result.imagePaths.isEmpty) {
+        setState(() => _busy = false);
+        return;
+      }
+
+      // 2. Hỏi tên file PDF
       final defaultName = '${pr.name}_${pr.pdfs.length + 1}';
       final opts = await askScanOptions(context, defaultName: defaultName);
       if (opts == null) {
-        _cleanup(images);
+        setState(() => _busy = false);
         return;
       }
-      final finalName =
-          opts.name.trim().isEmpty ? defaultName : opts.name.trim();
 
-      setState(() => _busy = true);
-
+      // 3. Ghép ảnh đã xử lý thành PDF
       final dir = await SessionService.ensureProcedureDir(
           _session.caseName, p.name, pr.name);
-
-      final safe = _sanitize(finalName);
+      final safe = _sanitize(opts.name);
       var finalPath = '${dir.path}/$safe.pdf';
       int i = 2;
       while (await File(finalPath).exists()) {
@@ -234,11 +246,10 @@ class _HomeScreenState extends State<HomeScreen> {
       }
 
       await PdfService.createPdf(
-        imagePaths: images,
+        imagePaths: result.imagePaths,
         outputPath: finalPath,
         mode: opts.mode,
       );
-      _cleanup(images);
 
       final fileName = finalPath.split('/').last;
       setState(() => pr.pdfs.add(fileName));
@@ -247,7 +258,6 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       toast(context, 'Đã lưu: $fileName');
 
-      // Mở xem trước ngay
       await Navigator.push(
         context,
         MaterialPageRoute(
@@ -256,18 +266,9 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       );
     } catch (e) {
-      if (images != null) _cleanup(images);
       if (mounted) toast(context, 'Lỗi quét: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  void _cleanup(List<String> paths) {
-    for (final p in paths) {
-      try {
-        File(p).deleteSync();
-      } catch (_) {}
     }
   }
 
@@ -318,7 +319,6 @@ class _HomeScreenState extends State<HomeScreen> {
       );
       if (!mounted) return;
 
-      // Không check ShareResultStatus — tránh lỗi version share_plus
       final clear = await confirm(
         context,
         title: 'Đã gửi xong!',
